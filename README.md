@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2604">
+  <a href="https://arxiv.org/pdf/2604.25636">
     <img
       src="https://img.shields.io/badge/RvR-Paper-red?logo=arxiv&logoColor=red"
       alt="RvR Paper on arXiv"
@@ -40,7 +40,7 @@ The figure below shows representative examples before and after refinement with 
 <p align="center"><img src="assets/overview.png" width="95%"></p>
 
 ## 📢 News
-- **April 28, 2026:** We released the official [report]() and [model](https://huggingface.co/JiayiGuo821/RvR-7B-MoT).
+- **April 28, 2026:** We released the official [report](https://arxiv.org/pdf/2604.25636) and [model](https://huggingface.co/JiayiGuo821/RvR-7B-MoT).
 
 ## 🔥 Quick Start
 
@@ -142,5 +142,13 @@ Our code is built upon [BAGEL](https://github.com/ByteDance-Seed/Bagel).
 ## ✍️ Citation
 
 ```bibtex
-
+@misc{guo2026rvr,
+      title={Refinement via Regeneration: Enlarging Modification Space Boosts Image Refinement in Unified Multimodal Models}, 
+      author={Jiayi Guo and Linqing Wang and Jiangshan Wang and Yang Yue and Zeyu Liu and Zhiyuan Zhao and Qinglin Lu and Gao Huang and Chunyu Wang},
+      year={2026},
+      eprint={2604.25636},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2604.25636}, 
+}
 ```
