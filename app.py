@@ -1,6 +1,7 @@
 import gradio as gr
 import numpy as np
 import os
+import gc
 import torch
 import random
 
@@ -52,6 +53,11 @@ vit_config.rope = False
 vit_config.num_hidden_layers -= 1
 
 vae_model, vae_config = load_ae(local_path=os.path.join(model_path, "ae.safetensors"))
+# The on-disk ae.safetensors may still keep conv weights/bias in fp32, but the
+# inferencer's autocast region casts the latent to bf16, which would mismatch a
+# fp32 bias inside conv2d. Move the VAE to cuda and bf16 so its dtype matches
+# the main model.
+vae_model = vae_model.to(device="cuda", dtype=torch.bfloat16).eval()
 
 config = BagelConfig(
     visual_gen=True,
@@ -65,24 +71,11 @@ config = BagelConfig(
     max_latent_size=64,
 )
 
-with init_empty_weights():
-    language_model = Qwen2ForCausalLM(llm_config)
-    vit_model      = SiglipVisionModel(vit_config)
-    model          = Bagel(language_model, vit_model, config)
-    model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
-
 tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
 tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
 vae_transform = ImageTransform(1024, 512, 16)
 vit_transform = ImageTransform(980, 224, 14)
-
-# Model loading and multi-GPU inference setup
-device_map = infer_auto_device_map(
-    model,
-    max_memory={i: "80GiB" for i in range(torch.cuda.device_count())},
-    no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
-)
 
 same_device_modules = [
     'language_model.model.embed_tokens',
@@ -94,58 +87,149 @@ same_device_modules = [
     'vit_pos_embed'
 ]
 
-if torch.cuda.device_count() == 1:
-    first_device = device_map.get(same_device_modules[0], "cuda:0")
-    for k in same_device_modules:
-        if k in device_map:
+
+def _build_and_load(ema_path):
+    """Build an empty Bagel model and load/quantize the given EMA weights based on args.mode.
+
+    mode=1: bf16, dispatched directly via load_checkpoint_and_dispatch.
+    mode=2/3: NF4/INT8, weights are re-quantized via load_and_quantize_model. This is the
+    correct way to swap weights under quantized modes; doing an in-place copy on already
+    quantized parameters would write fp weights into uint8/int8 storage and produce noise.
+
+    Returns the loaded model in eval mode.
+    """
+    with init_empty_weights():
+        language_model = Qwen2ForCausalLM(llm_config)
+        vit_model      = SiglipVisionModel(vit_config)
+        m              = Bagel(language_model, vit_model, config)
+        m.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
+
+    device_map = infer_auto_device_map(
+        m,
+        max_memory={i: "80GiB" for i in range(torch.cuda.device_count())},
+        no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
+    )
+
+    def _is_cuda_device(d):
+        return d is not None and str(d).startswith("cuda")
+
+    if torch.cuda.device_count() == 1:
+        first_device = device_map.get(same_device_modules[0], "cuda:0")
+        if not _is_cuda_device(first_device):
+            first_device = "cuda:0"
+        for k in same_device_modules:
             device_map[k] = first_device
-        else:
-            device_map[k] = "cuda:0"
-else:
-    first_device = device_map.get(same_device_modules[0])
-    for k in same_device_modules:
-        if k in device_map:
-            device_map[k] = first_device
+    else:
+        first_device = device_map.get(same_device_modules[0])
+        if not _is_cuda_device(first_device):
+            # Fallback: under memory pressure accelerate may put the anchor module
+            # on cpu/disk; force it onto a cuda device so inference does not cross
+            # devices.
+            for v in device_map.values():
+                if _is_cuda_device(v):
+                    first_device = v
+                    break
+            if not _is_cuda_device(first_device):
+                first_device = "cuda:0"
+        for k in same_device_modules:
+            if k in device_map:
+                device_map[k] = first_device
+
+    if args.mode == 1:
+        m = load_checkpoint_and_dispatch(
+            m,
+            checkpoint=ema_path,
+            device_map=device_map,
+            offload_buffers=True,
+            offload_folder="offload",
+            dtype=torch.bfloat16,
+            force_hooks=True,
+        ).eval()
+    elif args.mode == 2:  # NF4 quantization
+        bnb_quantization_config = BnbQuantizationConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=False,
+            bnb_4bit_quant_type="nf4",
+        )
+        m = load_and_quantize_model(
+            m,
+            weights_location=ema_path,
+            bnb_quantization_config=bnb_quantization_config,
+            device_map=device_map,
+            offload_folder="offload",
+        ).eval()
+    elif args.mode == 3:  # INT8 quantization
+        bnb_quantization_config = BnbQuantizationConfig(load_in_8bit=True, torch_dtype=torch.float32)
+        m = load_and_quantize_model(
+            m,
+            weights_location=ema_path,
+            bnb_quantization_config=bnb_quantization_config,
+            device_map=device_map,
+            offload_folder="offload",
+        ).eval()
+    else:
+        raise NotImplementedError
+
+    # Debug print: confirm where accelerate actually placed the anchor module.
+    try:
+        emb_dev = m.language_model.model.embed_tokens.weight.device
+    except Exception:
+        emb_dev = "?"
+    print(f"[_build_and_load] mode={args.mode}, first_device={first_device}, "
+          f"embed_tokens.weight.device={emb_dev}")
+
+    # Fallback: force non-quantized anchor modules in same_device_modules to live
+    # on first_device. Skip bnb.Linear4bit / Linear8bitLt because their packed
+    # storage cannot be naively moved with .to().
+    _force_anchor_modules_on_device(m, first_device)
+
+    return m
+
+
+def _force_anchor_modules_on_device(m, target_device):
+    """Ensure non-quantized modules in same_device_modules live on target_device.
+
+    bnb.Linear4bit / Linear8bitLt are skipped because their packed storage
+    cannot be relocated via a naive .to(). Other non-quantized small modules
+    (Embedding / LayerNorm / small projections) are forced onto target_device.
+    Note: we intentionally do not strip accelerate hooks here, so any device
+    alignment behavior they provide remains intact.
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        bnb = None
+
+    quantized_types = tuple(
+        cls for cls in (
+            getattr(bnb.nn, "Linear4bit", None) if bnb is not None else None,
+            getattr(bnb.nn, "Linear8bitLt", None) if bnb is not None else None,
+        ) if cls is not None
+    )
+
+    for name in same_device_modules:
+        try:
+            sub = m.get_submodule(name)
+        except AttributeError:
+            continue
+        if quantized_types and isinstance(sub, quantized_types):
+            continue
+        try:
+            sub.to(target_device)
+        except Exception as e:
+            print(f"[_force_anchor_modules_on_device] move {name} -> {target_device} failed: {e}")
+
 
 # Initially load BAGEL's EMA weights (used for T2I); rvr.safetensors will be hot-swapped in when switching to RvR.
 _initial_ema = os.path.join(model_path, EMA_FILES["BAGEL"])
-
-if args.mode == 1:
-    model = load_checkpoint_and_dispatch(
-        model,
-        checkpoint=_initial_ema,
-        device_map=device_map,
-        offload_buffers=True,
-        offload_folder="offload",
-        dtype=torch.bfloat16,
-        force_hooks=True,
-    ).eval()
-elif args.mode == 2:  # NF4 quantization
-    bnb_quantization_config = BnbQuantizationConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=False, bnb_4bit_quant_type="nf4")
-    model = load_and_quantize_model(
-        model, 
-        weights_location=_initial_ema,
-        bnb_quantization_config=bnb_quantization_config,
-        device_map=device_map,
-        offload_folder="offload",
-    ).eval()
-elif args.mode == 3:  # INT8 quantization
-    bnb_quantization_config = BnbQuantizationConfig(load_in_8bit=True, torch_dtype=torch.float32)
-    model = load_and_quantize_model(
-        model, 
-        weights_location=_initial_ema,
-        bnb_quantization_config=bnb_quantization_config,
-        device_map=device_map,
-        offload_folder="offload",
-    ).eval()
-else:
-    raise NotImplementedError
-
+model = _build_and_load(_initial_ema)
 current_model_name = "BAGEL"
 
 
 def reload_model_ema(model_choice):
-    global current_model_name
+    global current_model_name, model
+
     if model_choice == current_model_name:
         return f"✅ Current model is: {model_choice}"
 
@@ -154,18 +238,38 @@ def reload_model_ema(model_choice):
         return f"❌ File not found: {ema_path}"
 
     print(f"[reload] Loading EMA from: {ema_path}")
-    state_dict = load_safetensors(ema_path, device="cpu")
 
-    for name, param in model.named_parameters():
-        if name in state_dict:
-            param.data.copy_(state_dict[name].to(device=param.device, dtype=param.dtype))
-    for name, buf in model.named_buffers():
-        if name in state_dict:
-            buf.data.copy_(state_dict[name].to(device=buf.device, dtype=buf.dtype))
+    if args.mode == 1:
+        # bf16: parameter dtype matches the on-disk weights, so an in-place copy is safe.
+        state_dict = load_safetensors(ema_path, device="cpu")
+        for name, param in model.named_parameters():
+            if name in state_dict:
+                param.data.copy_(state_dict[name].to(device=param.device, dtype=param.dtype))
+        for name, buf in model.named_buffers():
+            if name in state_dict:
+                buf.data.copy_(state_dict[name].to(device=buf.device, dtype=buf.dtype))
+        del state_dict
+    else:
+        # NF4 / INT8: parameters are packed uint8/int8 with quant_state. We must rebuild
+        # the model and re-quantize the new weights; an in-place copy would corrupt them.
+        print(f"[reload] mode={args.mode}, rebuilding model and re-quantizing ...")
+        # Drop the inferencer's reference to the old model first; otherwise the
+        # refcount never hits zero, empty_cache cannot reclaim the VRAM, and the
+        # rebuilt model may have some submodules pushed onto cpu by accelerate.
+        if 'inferencer' in globals():
+            inferencer.model = None
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-    del state_dict
+        model = _build_and_load(ema_path)
+        # Keep the inferencer's model reference in sync with the rebuilt model.
+        if 'inferencer' in globals():
+            inferencer.model = model
+
     torch.cuda.empty_cache()
-
     current_model_name = model_choice
     print(f"[reload] Model switched to: {model_choice}")
     return f"✅ Successfully switched to: {model_choice}"
